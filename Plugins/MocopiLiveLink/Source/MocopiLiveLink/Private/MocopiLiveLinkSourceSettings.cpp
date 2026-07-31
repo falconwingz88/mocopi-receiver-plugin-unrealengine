@@ -20,12 +20,54 @@
 
 UMocopiLiveLinkSourceSettings::UMocopiLiveLinkSourceSettings()
 {
-	// Keep enough history for Live Link's animation interpolation to bridge
-	// ordinary Wi-Fi jitter while accepting a small, predictable delay.
+	ApplyReliabilityPreset();
+}
+
+void UMocopiLiveLinkSourceSettings::ApplyReliabilityPreset()
+{
 	Mode = ELiveLinkSourceMode::EngineTime;
-	BufferSettings.EngineTimeOffset = 0.12f;
-	BufferSettings.MaxNumberOfFrameToBuffered = 120;
 	BufferSettings.bValidEngineTimeEnabled = true;
-	BufferSettings.ValidEngineTime = 2.0f;
 	BufferSettings.bKeepAtLeastOneFrame = true;
+	bRejectDuplicateAndOutOfOrderFrames = true;
+	bUsePacketTimestampRecovery = true;
+
+	switch (ReliabilityPreset)
+	{
+	case EMocopiReliabilityPreset::Realtime:
+		BufferSettings.EngineTimeOffset = 0.04f;
+		BufferSettings.MaxNumberOfFrameToBuffered = 60;
+		BufferSettings.ValidEngineTime = 1.0f;
+		UdpReceiveBufferSizeKB = 256;
+		ConnectionTimeoutSeconds = 1.0f;
+		bEnablePoseSmoothing = false;
+		RotationSmoothingStrength = 0.05f;
+		TranslationSmoothingStrength = 0.03f;
+		break;
+
+	case EMocopiReliabilityPreset::Reliable:
+		BufferSettings.EngineTimeOffset = 0.20f;
+		BufferSettings.MaxNumberOfFrameToBuffered = 160;
+		BufferSettings.ValidEngineTime = 4.0f;
+		UdpReceiveBufferSizeKB = 1024;
+		ConnectionTimeoutSeconds = 3.0f;
+		bEnablePoseSmoothing = true;
+		RotationSmoothingStrength = 0.30f;
+		TranslationSmoothingStrength = 0.25f;
+		break;
+
+	case EMocopiReliabilityPreset::Smooth:
+		BufferSettings.EngineTimeOffset = 0.12f;
+		BufferSettings.MaxNumberOfFrameToBuffered = 120;
+		BufferSettings.ValidEngineTime = 2.0f;
+		UdpReceiveBufferSizeKB = 512;
+		ConnectionTimeoutSeconds = 2.0f;
+		bEnablePoseSmoothing = true;
+		RotationSmoothingStrength = 0.20f;
+		TranslationSmoothingStrength = 0.15f;
+		break;
+
+	case EMocopiReliabilityPreset::Custom:
+	default:
+		break;
+	}
 }

@@ -20,6 +20,7 @@
 #include "Roles/LiveLinkAnimationTypes.h"
 #include "HAL/Runnable.h"
 #include "MocopiDataHandler.h"
+#include "MocopiNetworkSimulator.h"
 #include "Modules/ModuleManager.h"
 #include "Sockets.h"
 
@@ -79,6 +80,12 @@ private:
 
   void HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> receivedData);
 
+  void QueueOrProcessReceivedData(TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> ReceivedData);
+
+  void ProcessPendingSimulatedPackets(bool bFlushAll = false);
+
+  FMocopiNetworkSimulationConfig GetNetworkSimulationConfig() const;
+
   void OpenConnection();
 
   void StartUdpThread();
@@ -113,6 +120,28 @@ private:
   std::atomic<float> mRotationSmoothingStrength;
   std::atomic<float> mTranslationSmoothingStrength;
 
+  std::atomic<bool> mEnableNetworkSimulation;
+  std::atomic<int32> mSimulationSeed;
+  std::atomic<float> mRandomPacketLossPercent;
+  std::atomic<int32> mBurstLossIntervalFrames;
+  std::atomic<int32> mBurstLossLengthFrames;
+  std::atomic<float> mMaximumJitterMs;
+  std::atomic<float> mDuplicatePacketPercent;
+  std::atomic<float> mReorderPacketPercent;
+  std::atomic<float> mReorderExtraDelayMs;
+
+  struct FPendingSimulatedPacket
+  {
+    TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> Data;
+    std::chrono::steady_clock::time_point ReleaseTime;
+    uint64 Sequence = 0;
+  };
+
+  FMocopiNetworkSimulator mNetworkSimulator;
+  TArray<FPendingSimulatedPacket> mPendingSimulatedPackets;
+  uint64 mNextSimulatedPacketSequence;
+  bool mWasNetworkSimulationEnabled;
+
   TArray<FTransform> mPreviousSmoothedTransforms;
   bool mHasPreviousSmoothedFrame;
 
@@ -123,6 +152,9 @@ private:
   std::atomic<uint64> mReceivedFrames;
   std::atomic<uint64> mEstimatedLostFrames;
   std::atomic<uint64> mRejectedFrames;
+  std::atomic<uint64> mSimulatedDroppedPackets;
+  std::atomic<uint64> mSimulatedDelayedPackets;
+  std::atomic<uint64> mSimulatedDuplicatePackets;
 
   TWeakObjectPtr<UMocopiLiveLinkSourceSettings> mSettings;
 
