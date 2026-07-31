@@ -35,6 +35,8 @@ mocopi Receiver Plugin for Unreal Engine is a plugin for receiving motion data t
 - **Unreal Engine**: Unreal Engine 5.5 or later
 - **Network**: Local network connection between mocopi app and Unreal Engine application
 
+> **Windows packaging support**: `PackagePluginWindows.bat` targets Unreal Engine 5.5, 5.6, 5.7, and 5.8.
+
 ### Runtime Requirements
 - mocopi app (Mobile version: Android/iOS, or PC version: Windows)
 - UDP communication connection between mocopi app and Unreal Engine application
@@ -51,6 +53,8 @@ mocopi Receiver Plugin for Unreal Engine is a plugin for receiving motion data t
 ```bash
 BuildScripts/PackagePluginWindows.bat
 ```
+
+The Windows script packages separate plugin builds for Unreal Engine 5.5 through 5.8.
 
 #### macOS
 ```bash
