@@ -64,6 +64,20 @@ BuildScripts/PackagePluginMac.sh
 
 This will create a packaged plugin in the output directory.
 
+### Reliability tuning
+
+The mocopi source defaults to a 120 ms Engine Time offset with a 120-frame Live Link buffer. Packet Timestamp Recovery uses the capture timestamp embedded in each mocopi packet, allowing Live Link to interpolate between the surrounding real poses when intermediate UDP packets are missing. This follows the same timestamp-buffering principle used by Sony's Unity receiver.
+
+Select the mocopi source in **Window > Virtual Production > Live Link** to adjust:
+
+- **Buffer Size (Frames)** and **Engine Time Offset** for the delay-versus-resilience tradeoff
+- **UDP Receive Buffer Size** and **Connection Timeout** for burst and dropout tolerance
+- **Use Packet Timestamp Recovery** to reconstruct smooth playback timing across short packet-loss gaps
+- **Rotation Smoothing Strength** and **Translation Smoothing Strength** for pose filtering
+- duplicate/out-of-order rejection and live received/lost/rejected frame diagnostics
+
+Higher offsets and smoothing strengths improve stability at the cost of responsiveness. Start with the defaults before increasing them.
+
 ### Installing to Your Project
 
 1. Copy the built plugin to your Unreal Engine project's `Plugins` directory
@@ -117,7 +131,8 @@ To check the samples, please refer to the plugin's Content folder after installa
 **Q: Avatar movement appears jerky**
 - Please check network latency and stability
 - Please verify frame rate settings in the mocopi app
-- Please consider implementing motion smoothing
+- Enable **Use Packet Timestamp Recovery**, then increase **Engine Time Offset** in small steps (for example, from 0.12 s to 0.16 s)
+- Increase rotation or translation smoothing only as much as needed, because stronger smoothing adds response lag
 
 For additional troubleshooting, please see the [FAQ](https://www.sony.co.jp/en/Products/mocopi-dev/en/documents/ReceiverPlugin/UnrealEngine/TroubleShoot.html).
 

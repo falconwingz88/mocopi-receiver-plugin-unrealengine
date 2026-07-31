@@ -25,6 +25,8 @@
 
 #include <chrono>
 
+class UMocopiLiveLinkSourceSettings;
+
 class FMocopiLiveLinkSource : public ILiveLinkSource, public FRunnable
 {
 public:
@@ -34,6 +36,10 @@ public:
 
   // ILiveLinkSource Interface 
   virtual void ReceiveClient(ILiveLinkClient* InClient, FGuid InSourceGuid) override;
+  virtual void InitializeSettings(ULiveLinkSourceSettings* Settings) override;
+  virtual void Update() override;
+  virtual TSubclassOf<ULiveLinkSourceSettings> GetSettingsClass() const override;
+  virtual void OnSettingsChanged(ULiveLinkSourceSettings* Settings, const FPropertyChangedEvent& PropertyChangedEvent) override;
   virtual bool IsSourceStillValid() const;
   virtual bool RequestSourceShutdown();
 
@@ -87,10 +93,38 @@ private:
 
   FQualifiedFrameTime GetQualifiedFrameTime(MocopiFrameMetaData& frameMetaData);
 
+  void ApplySettings(UMocopiLiveLinkSourceSettings* Settings);
+
+  void ResetStreamState();
+
+  bool ShouldAcceptFrame(int32 FrameId);
+
+  FTransform ApplyPoseSmoothing(int32 BoneIndex, const FTransform& RawTransform);
+
   FName mSubjectName; // This instance's LiveLink subject
 
   std::chrono::steady_clock::time_point mPreviousFrameArrivalTime;
-  const double TIMEOUT_MS = 400;
+  std::atomic<double> mConnectionTimeoutMs;
+
+  std::atomic<bool> mRejectDuplicateAndOutOfOrderFrames;
+  std::atomic<bool> mUsePacketTimestampRecovery;
+
+  std::atomic<bool> mEnablePoseSmoothing;
+  std::atomic<float> mRotationSmoothingStrength;
+  std::atomic<float> mTranslationSmoothingStrength;
+
+  TArray<FTransform> mPreviousSmoothedTransforms;
+  bool mHasPreviousSmoothedFrame;
+
+  int32 mLastFrameId;
+  bool mHasLastFrameId;
+  bool mTimedOut;
+
+  std::atomic<uint64> mReceivedFrames;
+  std::atomic<uint64> mEstimatedLostFrames;
+  std::atomic<uint64> mRejectedFrames;
+
+  TWeakObjectPtr<UMocopiLiveLinkSourceSettings> mSettings;
 
   double mPreviousFrameTimestamp_ms; // Helps determine mocopi FPS. Temporary Fix. Will Receive FPS from the App in the future.
   int mCurrentMocopiFPS;

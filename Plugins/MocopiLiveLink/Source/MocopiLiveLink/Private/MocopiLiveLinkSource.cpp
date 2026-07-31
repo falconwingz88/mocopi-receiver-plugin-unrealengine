@@ -15,6 +15,7 @@
 ////
 
 #include "MocopiLiveLinkSource.h"
+#include "MocopiLiveLinkSourceSettings.h"
 #include "MocopiLog.h"
 
 #include "ILiveLinkClient.h"
@@ -28,7 +29,9 @@
 
 #define LOCTEXT_NAMESPACE "MocopiLiveLinkModule"
 
-const uint16 MAX_BUFFER_SIZE = 4096;
+const uint16 MOCOPI_MAX_PACKET_SIZE = 4096;
+const int32 DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE = 512 * 1024;
+const double DEFAULT_CONNECTION_TIMEOUT_MS = 2000.0;
 const FString DEFAULT_UDP_THREAD_NAME = "MocopiUdpThread";
 
 FMocopiLiveLinkSource::FMocopiLiveLinkSource(uint16 inputPort, FName subjectName) :
@@ -42,6 +45,19 @@ FMocopiLiveLinkSource::FMocopiLiveLinkSource(uint16 inputPort, FName subjectName
   mClient(nullptr),
   mSourceGuid(),
   mSubjectName(subjectName),
+  mConnectionTimeoutMs(DEFAULT_CONNECTION_TIMEOUT_MS),
+  mRejectDuplicateAndOutOfOrderFrames(true),
+  mUsePacketTimestampRecovery(true),
+  mEnablePoseSmoothing(true),
+  mRotationSmoothingStrength(0.20f),
+  mTranslationSmoothingStrength(0.15f),
+  mHasPreviousSmoothedFrame(false),
+  mLastFrameId(0),
+  mHasLastFrameId(false),
+  mTimedOut(false),
+  mReceivedFrames(0),
+  mEstimatedLostFrames(0),
+  mRejectedFrames(0),
   mPreviousFrameTimestamp_ms(0),
   mCurrentMocopiFPS(50),
   mNeedsToProcessSkelDef(true)
@@ -67,9 +83,9 @@ void FMocopiLiveLinkSource::OpenConnection()
     .AsReusable()
     .BoundToAddress(FIPv4Address::Any)
     .BoundToPort(mInputPort)
-    .WithReceiveBufferSize(MAX_BUFFER_SIZE);
+    .WithReceiveBufferSize(DEFAULT_SOCKET_RECEIVE_BUFFER_SIZE);
 
-  mRecvBuffer.SetNumUninitialized(MAX_BUFFER_SIZE);
+  mRecvBuffer.SetNumUninitialized(MOCOPI_MAX_PACKET_SIZE);
 
   if ((mSocket != nullptr) && (mSocket->GetSocketType() == SOCKTYPE_Datagram))
   {
@@ -97,6 +113,63 @@ void FMocopiLiveLinkSource::ReceiveClient(ILiveLinkClient* InClient, FGuid InSou
   OpenConnection();
 }
 
+void FMocopiLiveLinkSource::InitializeSettings(ULiveLinkSourceSettings* Settings)
+{
+  UMocopiLiveLinkSourceSettings* MocopiSettings = Cast<UMocopiLiveLinkSourceSettings>(Settings);
+  mSettings = MocopiSettings;
+  ApplySettings(MocopiSettings);
+}
+
+void FMocopiLiveLinkSource::Update()
+{
+  if (UMocopiLiveLinkSourceSettings* Settings = mSettings.Get())
+  {
+    Settings->ReceivedFrames = mReceivedFrames.load();
+    Settings->EstimatedLostFrames = mEstimatedLostFrames.load();
+    Settings->RejectedFrames = mRejectedFrames.load();
+  }
+}
+
+TSubclassOf<ULiveLinkSourceSettings> FMocopiLiveLinkSource::GetSettingsClass() const
+{
+  return UMocopiLiveLinkSourceSettings::StaticClass();
+}
+
+void FMocopiLiveLinkSource::OnSettingsChanged(ULiveLinkSourceSettings* Settings, const FPropertyChangedEvent& PropertyChangedEvent)
+{
+  (void)PropertyChangedEvent;
+  ApplySettings(Cast<UMocopiLiveLinkSourceSettings>(Settings));
+}
+
+void FMocopiLiveLinkSource::ApplySettings(UMocopiLiveLinkSourceSettings* Settings)
+{
+  if (Settings == nullptr)
+  {
+    return;
+  }
+
+  mConnectionTimeoutMs.store(FMath::Max(400.0, static_cast<double>(Settings->ConnectionTimeoutSeconds) * 1000.0));
+  mRejectDuplicateAndOutOfOrderFrames.store(Settings->bRejectDuplicateAndOutOfOrderFrames);
+  mUsePacketTimestampRecovery.store(Settings->bUsePacketTimestampRecovery);
+  mEnablePoseSmoothing.store(Settings->bEnablePoseSmoothing);
+  mRotationSmoothingStrength.store(FMath::Clamp(Settings->RotationSmoothingStrength, 0.0f, 0.95f));
+  mTranslationSmoothingStrength.store(FMath::Clamp(Settings->TranslationSmoothingStrength, 0.0f, 0.95f));
+
+  if (mSocket != nullptr)
+  {
+    const int32 RequestedBufferSize = FMath::Clamp(Settings->UdpReceiveBufferSizeKB, 64, 4096) * 1024;
+    int32 ActualBufferSize = 0;
+    if (!mSocket->SetReceiveBufferSize(RequestedBufferSize, ActualBufferSize))
+    {
+      UE_LOG(LogMocopiLiveLink, Warning, TEXT("Unable to set UDP receive buffer to %d bytes"), RequestedBufferSize);
+    }
+    else
+    {
+      UE_LOG(LogMocopiLiveLink, Log, TEXT("UDP receive buffer set to %d bytes"), ActualBufferSize);
+    }
+  }
+}
+
 void FMocopiLiveLinkSource::StartUdpThread()
 {
   if ((mSocket == nullptr) || (mSocket->GetSocketType() != SOCKTYPE_Datagram))
@@ -109,6 +182,7 @@ void FMocopiLiveLinkSource::StartUdpThread()
   FString udpThreadName = DEFAULT_UDP_THREAD_NAME + mInputPort;
 
   mSocketSubSystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+  mPreviousFrameArrivalTime = std::chrono::steady_clock::now();
   mUdpThreadName = udpThreadName;
   mUdpThreadName.AppendInt(FAsyncThreadIndex::GetNext());
 
@@ -149,15 +223,18 @@ uint32 FMocopiLiveLinkSource::Run()
         }
 
         mPreviousFrameArrivalTime = clock::now();
+        mTimedOut = false;
       }
     }
     else
     {
       std::chrono::duration<double, std::milli> duration_ms = clock::now() - mPreviousFrameArrivalTime;
-      if (duration_ms.count() > TIMEOUT_MS)
+      if (!mTimedOut && duration_ms.count() > mConnectionTimeoutMs.load())
       {
         // Reset variable for future data stream
         mNeedsToProcessSkelDef = true;
+        ResetStreamState();
+        mTimedOut = true;
       }
     }
   }
@@ -172,12 +249,17 @@ void FMocopiLiveLinkSource::UpdateFrameData(FLiveLinkAnimationFrameData& outFram
   const size_t numBones = mDataHandler.GetNumBones();
 
   outFrame.Transforms.SetNumUninitialized(numBones);
+  if (mPreviousSmoothedTransforms.Num() != static_cast<int32>(numBones))
+  {
+    mPreviousSmoothedTransforms.SetNumUninitialized(static_cast<int32>(numBones));
+    mHasPreviousSmoothedFrame = false;
+  }
 
   // Set Root bone translation individually
   const MocopiBoneData root = mDataHandler.GetBoneInfoByIndex(0);
   FVector boneTranslation = FVector(root.translate[0], root.translate[1], root.translate[2]);
   FQuat boneRotation = FQuat(root.rotate[0], root.rotate[1], root.rotate[2], root.rotate[3]);
-  outFrame.Transforms[0] = FTransform(boneRotation, boneTranslation);
+  outFrame.Transforms[0] = ApplyPoseSmoothing(0, FTransform(boneRotation, boneTranslation));
 
   // Then Set values for rest of the bones
   for (size_t i = 1; i < numBones; i++)
@@ -186,15 +268,112 @@ void FMocopiLiveLinkSource::UpdateFrameData(FLiveLinkAnimationFrameData& outFram
     boneTranslation = FVector(bone.defaultTranslate[0], bone.defaultTranslate[1], bone.defaultTranslate[2]);
     boneRotation = FQuat(bone.rotate[0], bone.rotate[1], bone.rotate[2], bone.rotate[3]);
 
-    outFrame.Transforms[i] = FTransform(boneRotation, boneTranslation);
+    outFrame.Transforms[i] = ApplyPoseSmoothing(static_cast<int32>(i), FTransform(boneRotation, boneTranslation));
   }
+
+  mHasPreviousSmoothedFrame = true;
 
   // Set Timecode information on this frame
   MocopiFrameMetaData metaData = mDataHandler.GetFrameMetaData();
+
+  // mocopi packets carry their capture timestamp. Supplying that source time
+  // lets Live Link evaluate between the surrounding real poses, including
+  // when one or more intermediate UDP packets were lost. Live Link estimates
+  // the clock offset to engine time from the separately stamped arrival time.
+  if (mUsePacketTimestampRecovery.load() && FMath::IsFinite(metaData.timeStamp))
+  {
+    outFrame.WorldTime = FLiveLinkWorldTime(static_cast<double>(metaData.timeStamp), 0.0);
+  }
+
   FQualifiedFrameTime mocopiFrameTime = GetQualifiedFrameTime(metaData);
   outFrame.MetaData.SceneTime = mocopiFrameTime;
   outFrame.FrameId = metaData.frameId;
 
+}
+
+FTransform FMocopiLiveLinkSource::ApplyPoseSmoothing(int32 BoneIndex, const FTransform& RawTransform)
+{
+  FTransform SmoothedTransform = RawTransform;
+
+  if (mEnablePoseSmoothing.load() && mHasPreviousSmoothedFrame && mPreviousSmoothedTransforms.IsValidIndex(BoneIndex))
+  {
+    const FTransform& PreviousTransform = mPreviousSmoothedTransforms[BoneIndex];
+    const float RotationAlpha = 1.0f - mRotationSmoothingStrength.load();
+    const float TranslationAlpha = 1.0f - mTranslationSmoothingStrength.load();
+
+    const FQuat SmoothedRotation = FQuat::Slerp(PreviousTransform.GetRotation(), RawTransform.GetRotation(), RotationAlpha).GetNormalized();
+    const FVector SmoothedTranslation = FMath::Lerp(PreviousTransform.GetTranslation(), RawTransform.GetTranslation(), TranslationAlpha);
+
+    SmoothedTransform.SetRotation(SmoothedRotation);
+    SmoothedTransform.SetTranslation(SmoothedTranslation);
+  }
+
+  mPreviousSmoothedTransforms[BoneIndex] = SmoothedTransform;
+  return SmoothedTransform;
+}
+
+void FMocopiLiveLinkSource::ResetStreamState()
+{
+  mHasPreviousSmoothedFrame = false;
+  mPreviousSmoothedTransforms.Reset();
+  mHasLastFrameId = false;
+  mPreviousFrameTimestamp_ms = 0;
+}
+
+bool FMocopiLiveLinkSource::ShouldAcceptFrame(int32 FrameId)
+{
+  if (!mHasLastFrameId)
+  {
+    mLastFrameId = FrameId;
+    mHasLastFrameId = true;
+    mReceivedFrames.fetch_add(1);
+    return true;
+  }
+
+  const int64 FrameDelta = static_cast<int64>(FrameId) - static_cast<int64>(mLastFrameId);
+  if (FrameDelta == 0)
+  {
+    mRejectedFrames.fetch_add(1);
+    if (mRejectDuplicateAndOutOfOrderFrames.load())
+    {
+      return false;
+    }
+
+    mReceivedFrames.fetch_add(1);
+    return true;
+  }
+
+  if (FrameDelta < 0)
+  {
+    // A small negative delta is a late packet. A large jump is treated as a
+    // new sender session whose frame counter restarted.
+    if (FrameDelta > -1000)
+    {
+      mRejectedFrames.fetch_add(1);
+      if (mRejectDuplicateAndOutOfOrderFrames.load())
+      {
+        return false;
+      }
+
+      mReceivedFrames.fetch_add(1);
+      return true;
+    }
+
+    ResetStreamState();
+    mLastFrameId = FrameId;
+    mHasLastFrameId = true;
+    mReceivedFrames.fetch_add(1);
+    return true;
+  }
+
+  if (FrameDelta > 1 && FrameDelta < 10000)
+  {
+    mEstimatedLostFrames.fetch_add(static_cast<uint64>(FrameDelta - 1));
+  }
+
+  mLastFrameId = FrameId;
+  mReceivedFrames.fetch_add(1);
+  return true;
 }
 
 FQualifiedFrameTime FMocopiLiveLinkSource::GetQualifiedFrameTime(MocopiFrameMetaData& frameMetaData)
@@ -293,6 +472,11 @@ void FMocopiLiveLinkSource::HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode
     }
 
     mDataHandler.ProcessFrameData(dataBuffer, bufferSize);
+    const MocopiFrameMetaData MetaData = mDataHandler.GetFrameMetaData();
+    if (!ShouldAcceptFrame(MetaData.frameId))
+    {
+      return;
+    }
   }
   else if (mDataHandler.IsSkeletonDefinition(dataBuffer, bufferSize))
   {
@@ -306,6 +490,7 @@ void FMocopiLiveLinkSource::HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode
     DefineNewMocopiSubject();
 
     mNeedsToProcessSkelDef = false;
+    ResetStreamState();
   }
   else
   {
@@ -395,7 +580,13 @@ FText FMocopiLiveLinkSource::GetSourceMachineName() const
 FText FMocopiLiveLinkSource::GetSourceStatus() const
 {
   FText portString = FText::FromString(FString::FromInt(mInputPort)); // Need to do this to not have a comma in port number 
-  FText sourceStatus = FText::Format(LOCTEXT("SourceStatusReceiving", "Listening to port {0}"), portString);
+  FText receivedString = FText::AsNumber(mReceivedFrames.load());
+  FText lostString = FText::AsNumber(mEstimatedLostFrames.load());
+  FText sourceStatus = FText::Format(
+    LOCTEXT("SourceStatusReceiving", "Listening to port {0} | Frames {1} | Estimated lost {2}"),
+    portString,
+    receivedString,
+    lostString);
   return sourceStatus;
 }
 
