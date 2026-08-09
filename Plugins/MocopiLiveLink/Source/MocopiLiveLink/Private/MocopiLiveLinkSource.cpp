@@ -486,18 +486,18 @@ bool FMocopiLiveLinkSource::ShouldAcceptFrame(int32 FrameId)
     return true;
   }
 
-  const int64 FrameDelta = static_cast<int64>(FrameId) - static_cast<int64>(mLastFrameId);
-  if (FrameDelta == 0)
+const int64 FrameDelta = static_cast<int64>(FrameId) - static_cast<int64>(mLastFrameId);
+if (FrameDelta == 0)
+{
+  if (mRejectDuplicateAndOutOfOrderFrames.load())
   {
     mRejectedFrames.fetch_add(1);
-    if (mRejectDuplicateAndOutOfOrderFrames.load())
-    {
-      return false;
-    }
-
-    mReceivedFrames.fetch_add(1);
-    return true;
+    return false;
   }
+
+  mReceivedFrames.fetch_add(1);
+  return true;
+}
 
   if (FrameDelta < 0)
   {
