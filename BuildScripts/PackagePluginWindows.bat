@@ -25,7 +25,7 @@ REM 2.Add/Modify your UE Versions below
 REM 3.Add/Modify corresponding Engine installation paths
 REM 4.Add/Modify calls to the BuildAndPackage function 
 
-set Plugin_Version=1.0.6
+set Plugin_Version=1.0.7
 
 REM UE versions to package plugin for
 set "UE_V5=5.5"

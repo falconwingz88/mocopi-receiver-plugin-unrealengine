@@ -20,6 +20,7 @@
 
 #include "ILiveLinkClient.h"
 #include "Async/Async.h"
+#include "HAL/PlatformTime.h"
 #include "HAL/RunnableThread.h"
 #include "Common/UdpSocketBuilder.h"
 #include "Roles/LiveLinkAnimationRole.h"
@@ -81,8 +82,12 @@ FMocopiLiveLinkSource::FMocopiLiveLinkSource(uint16 inputPort, FName subjectName
   mNextSimulatedPacketSequence(0),
   mWasNetworkSimulationEnabled(false),
   mHasPreviousSmoothedFrame(false),
+  mHasPacketTimestampBase(false),
+  mPacketTimestampBase(0.0),
+  mEngineTimeBase(0.0),
   mLastFrameId(0),
   mHasLastFrameId(false),
+  mPendingStreamReset(false),
   mTimedOut(false),
   mReceivedFrames(0),
   mEstimatedLostFrames(0),
@@ -348,13 +353,11 @@ void FMocopiLiveLinkSource::UpdateFrameData(FLiveLinkAnimationFrameData& outFram
   // Set Timecode information on this frame
   MocopiFrameMetaData metaData = mDataHandler.GetFrameMetaData();
 
-  // mocopi packets carry their capture timestamp. Supplying that source time
-  // lets Live Link evaluate between the surrounding real poses, including
-  // when one or more intermediate UDP packets were lost. Live Link estimates
-  // the clock offset to engine time from the separately stamped arrival time.
+  // Convert mocopi packet timestamps to the engine-time domain using deltas.
+  // The raw timestamp is not guaranteed to share Live Link's clock origin.
   if (mUsePacketTimestampRecovery.load() && FMath::IsFinite(metaData.timeStamp))
   {
-    outFrame.WorldTime = FLiveLinkWorldTime(static_cast<double>(metaData.timeStamp), 0.0);
+    outFrame.WorldTime = FLiveLinkWorldTime(GetPacketTimestampWorldTime(static_cast<double>(metaData.timeStamp)), 0.0);
   }
 
   FQualifiedFrameTime mocopiFrameTime = GetQualifiedFrameTime(metaData);
@@ -472,11 +475,27 @@ void FMocopiLiveLinkSource::ResetStreamState()
 {
   mHasPreviousSmoothedFrame = false;
   mPreviousSmoothedTransforms.Reset();
+  mHasPacketTimestampBase = false;
+  mPacketTimestampBase = 0.0;
+  mEngineTimeBase = 0.0;
   mHasLastFrameId = false;
+  mPendingStreamReset = false;
   mPreviousFrameTimestamp_ms = 0;
 }
 
-bool FMocopiLiveLinkSource::ShouldAcceptFrame(int32 FrameId)
+double FMocopiLiveLinkSource::GetPacketTimestampWorldTime(double PacketTimestamp)
+{
+  if (!mHasPacketTimestampBase || PacketTimestamp < mPacketTimestampBase)
+  {
+    mHasPacketTimestampBase = true;
+    mPacketTimestampBase = PacketTimestamp;
+    mEngineTimeBase = FPlatformTime::Seconds();
+  }
+
+  return mEngineTimeBase + (PacketTimestamp - mPacketTimestampBase);
+}
+
+bool FMocopiLiveLinkSource::ShouldAcceptFrame(int32 FrameId, double PacketTimestamp)
 {
   if (!mHasLastFrameId)
   {
@@ -486,18 +505,27 @@ bool FMocopiLiveLinkSource::ShouldAcceptFrame(int32 FrameId)
     return true;
   }
 
-const int64 FrameDelta = static_cast<int64>(FrameId) - static_cast<int64>(mLastFrameId);
-if (FrameDelta == 0)
-{
-  if (mRejectDuplicateAndOutOfOrderFrames.load())
+  const int64 FrameDelta = static_cast<int64>(FrameId) - static_cast<int64>(mLastFrameId);
+  if (FrameDelta < 0 && FMath::IsFinite(PacketTimestamp) && mHasPacketTimestampBase && PacketTimestamp <= mPacketTimestampBase)
   {
-    mRejectedFrames.fetch_add(1);
-    return false;
+    ResetStreamState();
+    mLastFrameId = FrameId;
+    mHasLastFrameId = true;
+    mReceivedFrames.fetch_add(1);
+    return true;
   }
 
-  mReceivedFrames.fetch_add(1);
-  return true;
-}
+  if (FrameDelta == 0)
+  {
+    if (mRejectDuplicateAndOutOfOrderFrames.load())
+    {
+      mRejectedFrames.fetch_add(1);
+      return false;
+    }
+
+    mReceivedFrames.fetch_add(1);
+    return true;
+  }
 
   if (FrameDelta < 0)
   {
@@ -627,9 +655,14 @@ void FMocopiLiveLinkSource::HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode
       return;
     }
 
+    if (mPendingStreamReset)
+    {
+      ResetStreamState();
+    }
+
     mDataHandler.ProcessFrameData(dataBuffer, bufferSize);
     const MocopiFrameMetaData MetaData = mDataHandler.GetFrameMetaData();
-    if (!ShouldAcceptFrame(MetaData.frameId))
+    if (!ShouldAcceptFrame(MetaData.frameId, static_cast<double>(MetaData.timeStamp)))
     {
       return;
     }
@@ -638,6 +671,7 @@ void FMocopiLiveLinkSource::HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode
   {
     if (!mNeedsToProcessSkelDef)
     {
+      mPendingStreamReset = true;
       return;
     }
 
@@ -647,6 +681,7 @@ void FMocopiLiveLinkSource::HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode
 
     mNeedsToProcessSkelDef = false;
     ResetStreamState();
+    return;
   }
   else
   {

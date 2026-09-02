@@ -35,7 +35,7 @@ public:
   FMocopiLiveLinkSource(uint16 inputPort, FName subjectName);
   virtual ~FMocopiLiveLinkSource();
 
-  // ILiveLinkSource Interface 
+  // ILiveLinkSource Interface
   virtual void ReceiveClient(ILiveLinkClient* InClient, FGuid InSourceGuid) override;
   virtual void InitializeSettings(ULiveLinkSourceSettings* Settings) override;
   virtual void Update() override;
@@ -75,7 +75,7 @@ private:
   ILiveLinkClient* mClient;
   FGuid mSourceGuid;
 
-  // Helpers 
+  // Helpers
   void UpdateFrameData(FLiveLinkAnimationFrameData& outFrame);
 
   void HandleReceivedData(TSharedPtr<TArray<uint8>, ESPMode::ThreadSafe> receivedData);
@@ -104,7 +104,9 @@ private:
 
   void ResetStreamState();
 
-  bool ShouldAcceptFrame(int32 FrameId);
+  bool ShouldAcceptFrame(int32 FrameId, double PacketTimestamp);
+
+  double GetPacketTimestampWorldTime(double PacketTimestamp);
 
   FTransform ApplyPoseSmoothing(int32 BoneIndex, const FTransform& RawTransform);
 
@@ -145,8 +147,13 @@ private:
   TArray<FTransform> mPreviousSmoothedTransforms;
   bool mHasPreviousSmoothedFrame;
 
+  bool mHasPacketTimestampBase;
+  double mPacketTimestampBase;
+  double mEngineTimeBase;
+
   int32 mLastFrameId;
   bool mHasLastFrameId;
+  bool mPendingStreamReset;
   bool mTimedOut;
 
   std::atomic<uint64> mReceivedFrames;
